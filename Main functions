@@ -1,0 +1,117 @@
+"""
+This is a template algorithm on Quantopian for you to adapt and fill in.
+"""
+from quantopian.algorithm import attach_pipeline, pipeline_output
+from quantopian.pipeline import Pipeline
+from quantopian.pipeline.data.builtin import USEquityPricing
+from quantopian.pipeline.factors import AverageDollarVolume
+from quantopian.pipeline.filters.morningstar import Q500US
+ 
+import numpy as np
+import pytz
+#strategynumber = x 
+
+def initialize(context):
+    context.portfolio_values = []
+    context.cash_account = []
+    context.open_order = []
+    context.order_update = []
+    context.order_stock = []
+    context.track_commission = []
+    context.track_positions = [[],[],[]]
+    context.initial_cash = context.portfolio.starting_cash / strategynumber
+    for i in range(strategynumber):
+        context.portfolio_values.append(context.initial_cash)
+        context.cash_account.append(context.initial_cash)
+        context.open_order.append([])
+        context.order_update.append([])
+        context.order_stock.append([])
+        context.track_commission.append([])
+        #each strategy has three list, 0 is equity name, 1 is amount, 2 is total cost to create this position, including commission
+        context.track_positions.append([[],[],[]])
+    
+    schedule_function(s0_buy, date_rule=date_rules.every_day(),
+        time_rule=time_rules.market_open(minutes=1),
+        half_days=True
+    )
+#this function serves to update the positions and cost basis of the portfolio        
+def track_order(context, data, i):
+    if (context.open_order[i] != []):
+        for j in range(0,len(context.open_order[i])):
+            order = get_order(context.open_order[i][j])
+            if (order is not None):
+                if (context.order_update[i][j] != 0):
+                    last_filled = order.amount - context.order_update[i][j]
+                    shares_in = order.filled - last_filled
+                    #print "shares_in"
+                    #print shares_in
+                    cost = shares_in * data.current(context.order_stock[i][j],'price')
+                    context.order_update[i][j] = order.amount - order.filled
+                    new_commission = order.commission - context.track_commission[i][j]
+                    cost = cost + new_commission
+                    context.track_commission[i][j] = order.commission
+                    
+                    context.cash_account[i] = context.cash_account[i] - cost
+                    
+                if (context.order_stock[i][j] in context.track_positions[i][0]):
+                    loc = context.track_positions[i][0].index(context.order_stock[i][j])
+                    context.track_positions[i][1][loc] = context.track_positions[i][1][loc] + shares_in
+                    context.track_positions[i][2][loc] = context.track_positions[i][2][loc] + cost
+                else:
+                    context.track_positions[i][0].append(context.s1_order_stock[i])
+                    context.track_positions[i][1].append(order.filled)
+                    context.track_positions[i][2].append(cost)
+        
+        remove = []
+        for j in range(0,len(context.open_order[i])):
+            
+            if (context.order_update[i][j] == 0):
+                remove.append(j)
+        pop = 0 
+        
+        for j in range(0,len(remove)):  
+            context.open_order[i].pop(remove[j]-pop)
+            context.order_update[i].pop(remove[j]-pop)
+            context.order_stock[i].pop(remove[j]-pop)
+            context.track_commission[i].pop(remove[j]-pop)
+            
+            pop = pop + 1 
+            
+    
+    context.portfolio_values[i] = context.cash_account[i]
+    for j in range(len(context.track_positions[i][1])):
+        context.portfolio_values[i] = context.portfolio_values[i] + data.current(context.track_positions[i][0][j],'price') * context.s1_positions[i][1][j]
+        
+def make_order(context, data, order_method, sid, amount, OrderType, i):
+    if orderType == 0:
+        orderType = MarketOrder()
+    if (order_method is order):
+        my_order = order(sid, amount, style = OrderType)
+    elif (order_method is order_value):
+        order = order_value(sid, amount, style = OrderType)
+    elif (order_method is order_percent):
+        value = context.portfolio_values[i] * amount
+        my_order = order_value(sid, amount, style = OrderType)
+    elif (order_method is order_target):
+        loc = context.track_positions[i][0].index(context.order_stock[i][j])
+        target = amount - context.trackpositions[i][1][loc]
+        my_order = order(sid, target, style = OrderType)
+    elif (order_method is order_target_value):
+        loc = context.track_positions[i][0].index(context.order_stock[i][j])
+        holding_value = data.current(sid,'price')*context.trackpositions[i][1][loc]
+        ordering_value = amount - holding_value
+        my_order = order_value(sid, ordering_value, style = OrderType)
+    elif (order_method is order_target_percent):
+        loc = context.track_positions[i][0].index(context.order_stock[i][j])
+        holding_value = data.current(sid,'price')*context.trackpositions[i][1][loc]
+        ordering_value = amount*context.portfolio_values[i] - holding_value
+        my_order = order_value(sid, ordering_value, style = OrderType)
+    else:
+        my_order = 0
+        print "error in ordering" 
+    if (get_order(my_order) is not None): 
+        context.open_order[i].append(my_order)
+        context.order_update[i].append(get_order(my_order).amount)
+        context.order_stock[i].append(get_order(my_order).sid)
+        context.track_commission[i].append(0)
+        
