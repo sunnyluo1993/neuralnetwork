@@ -1,0 +1,732 @@
+"""
+This is a template algorithm on Quantopian for you to adapt and fill in.
+"""
+from quantopian.algorithm import attach_pipeline, pipeline_output
+from quantopian.pipeline import Pipeline
+from quantopian.pipeline.data.builtin import USEquityPricing
+from quantopian.pipeline.factors import AverageDollarVolume
+from quantopian.pipeline.filters.morningstar import Q500US
+ 
+import numpy as np
+import pytz
+strategynumber = 2 
+
+def initialize(context):
+    context.portfolio_values = []
+    context.track_leverage = []
+    context.cash_account = []
+    context.open_order = []
+    context.order_update = []
+    context.order_stock = []
+    context.track_commission = []
+    context.track_positions = []
+    context.initial_cash = context.portfolio.starting_cash / strategynumber
+    for i in range(strategynumber):
+        context.portfolio_values.append(context.initial_cash)
+        context.track_leverage.append(0)
+        context.cash_account.append(context.initial_cash)
+        context.open_order.append([])
+        context.order_update.append([])
+        context.order_stock.append([])
+        context.track_commission.append([])
+        #each strategy has three list, 0 is equity name, 1 is amount, 2 is total cost to create this position, including commission
+        context.track_positions.append([[],[],[]])
+
+    s0_initialize(context)
+    s1_initialize(context)
+    
+def s0_initialize(context):
+    #Parameters
+    context.s0_signalFetchFile = "https://dl.dropboxusercontent.com/s/uvuqnqzbzf7p1c7/dailySignal.csv"
+    context.s0_stockFetchFile  = "https://dl.dropboxusercontent.com/s/napvsyl53qn7hfl/dailySUSIR.csv"
+    context.s0_numberOfPF      = 5
+    context.s0_daysPerUpdate   = 5
+#Note that holding period for each portfolio is context.s0_numberOfPF * context.s0_daysPerUpdate
+    context.s0_longStockNum    = 20
+    context.s0_shortStockNum   = 20
+    context.s0_pfSizeScale     = 3
+    context.s0_longOverShort   = 0.52
+
+    
+    fetch_csv(context.s0_stockFetchFile,
+        pre_func=s0_previewFetch,    
+        date_column = "date", 
+        date_format = '%y/%m/%d')
+    
+    #Accounting variables
+    context.s0_counters          = s0_dotDict()
+    context.s0_counters.day      = -1
+    context.s0_toTrade           = s0_dotDict()
+    context.s0_rotPFs            = [s0_dotDict() for x in range(context.s0_numberOfPF)]
+    context.s0_longOrderID       = [None for x in range(context.s0_longStockNum)]
+    context.s0_shortOrderID      = [None for x in range(context.s0_shortStockNum)]
+    #Counter for which portfolio to rotate
+    context.s0_pfToUpdate        = 0
+    for x in range(context.s0_numberOfPF):
+        #Initialize all positions to zero so that first round of liquidation works.
+        context.s0_rotPFs[x].numLongPos     = [0 for y in range(context.s0_longStockNum)]
+        context.s0_rotPFs[x].numShortPos    = [0 for y in range(context.s0_shortStockNum)]
+        #symbol('SPY') is just a placeholder for an SID 
+        context.s0_rotPFs[x].longStockSID   = [symbol('SPY') for y in range(context.s0_longStockNum)]
+        context.s0_rotPFs[x].shortStockSID  = [symbol('SPY') for y in range(context.s0_shortStockNum)]
+        
+    schedule_function(
+        func=s0_rebalance,
+        date_rule=date_rules.every_day(),
+        time_rule=time_rules.market_open(minutes=1),
+        half_days=True
+    )
+    
+    schedule_function(
+        func=s0_check_end_of_day_position,
+        date_rule=date_rules.every_day(),
+        time_rule=time_rules.market_close(minutes=1),
+        half_days=True        
+    )
+
+def s1_initialize(context):
+    context.s1_setnumber = 3 
+    context.s1_stk = [[sid(3443),sid(33856),sid(8329)], [sid(2621),sid(2368),sid(8306)],[sid(24833),sid(5213),sid(16108)]]
+    context.s1_n_dim_state = 3
+    context.s1_y = []
+    context.s1_x = []
+    context.s1_beta = []
+    context.s1_rollingbeta1 = []
+    context.s1_rollingbeta2 = []
+    context.s1_P = []
+    context.s1_R = []
+    context.s1_sqrt_Q = []
+    context.s1_pos = []
+    context.s1_open_finished = []
+    context.s1_PL = []
+    context.s1_cashpos = []
+    context.s1_portpos = []
+    context.s1_cycle_return = []
+    context.s1_cumulative_return = []
+    context.s1_squaring = []
+    context.s1_squaring_target = []
+    context.s1_squaring_id = []
+    context.s1_costbasis = []
+    context.s1_stocks_filled = []
+    context.s1_squaring_cost = []
+    context.s1_squaring_finished = []
+    context.s1_squaring_unfinished = []
+    context.s1_stoploss = []
+    context.s1_stoplossCount = []
+    context.s1_uncertain = []
+    context.s1_beta1std = []
+    context.s1_beta2std = []
+    
+    for i in range(0,context.s1_setnumber):
+        context.s1_y.append(context.s1_stk[i][0])
+        x = []
+        x.append(context.s1_stk[i][1])
+        x.append(context.s1_stk[i][2])
+        context.s1_x.append(x)
+        context.s1_rollingbeta1.append([0,0,0,0,0])
+        context.s1_rollingbeta2.append([0,0,0,0,0])
+        P = np.zeros((context.s1_n_dim_state, context.s1_n_dim_state))
+        context.s1_P.append(P)
+        R = None
+        context.s1_R.append(R)
+        context.s1_sqrt_Q.append(0)
+        pos = "none"
+        context.s1_pos.append(pos)
+        context.s1_open_finished.append(1)
+        cashpos = context.portfolio_values[1] / context.s1_setnumber
+        portpos = context.portfolio_values[1] / context.s1_setnumber
+        context.s1_PL.append(0)
+        context.s1_cashpos.append(cashpos)
+        context.s1_portpos.append(portpos)
+        context.s1_cycle_return.append([0,0,0])
+        context.s1_cumulative_return.append([0,0,0])
+        context.s1_stoploss.append(0)
+        context.s1_stoplossCount.append(0)
+        context.s1_squaring.append(0)
+        context.s1_squaring_target.append([0,0,0])
+        context.s1_squaring_id.append([0,0,0])
+        context.s1_costbasis.append([0,0,0])
+        context.s1_stocks_filled.append([0,0,0])
+        context.s1_squaring_cost.append([0,0,0])
+        context.s1_squaring_finished.append([1,1,1])
+        context.s1_squaring_unfinished.append(0)
+        context.s1_uncertain.append(0)
+        context.s1_beta1std.append(0)
+        context.s1_beta2std.append(0)
+        
+                       
+    
+    #delta will decide the value of the covariance of the transition noise
+    context.s1_delta = 0.0001
+    #Vw is the covariance of the transition noise 
+    context.s1_Vw = context.s1_delta / (1 - context.s1_delta) * np.eye(context.s1_n_dim_state)
+    #Ve is the covariance of the measurement noise
+    context.s1_Ve = 0.25
+    
+    
+    context.s1_beta = [[0.87, 0.27, 0.25],[0.34, -0.13, 0.23],[0.99, 0.48, 0.26]]
+
+    context.s1_day = None
+    context.s1_dateCounter = 0
+    context.s1_activateDC = 0
+    
+def before_trading_start(context, data):
+    for i in range(strategynumber):
+        print "Portfolio {}".format(i)
+     #   for j in range(len(context.track_positions[i][0])):
+    #        print "have {} position of {}.".format(context.track_positions[i][0][j], context.track_positions[i][1][j])
+            
+        context.portfolio_values[i] = context.cash_account[i]
+        net_exposure = 0
+        for j in range(len(context.track_positions[i][0])):
+            context.portfolio_values[i] = context.portfolio_values[i] + data.current(context.track_positions[i][0][j],'price') * context.track_positions[i][1][j]
+            net_exposure = net_exposure + data.current(context.track_positions[i][0][j],'price') * np.absolute(context.track_positions[i][1][j])
+        context.track_leverage[i] = net_exposure / context.portfolio_values[i]
+    
+    port_est = sum(context.portfolio_values)
+    error = (port_est - context.portfolio.portfolio_value)/context.portfolio.portfolio_value
+    print "we have an error of {} in portfolio value".format(error)
+    s0_before_trading_start(context, data)
+    s1_before_trading_start(context, data)
+
+def s0_before_trading_start(context,data):
+    context.s0_counters.day = context.s0_counters.day + 1    
+    if (context.s0_counters.day%context.s0_daysPerUpdate == 0):
+        log.info("Rebalancing portfolio: " + str(context.s0_pfToUpdate))
+        s0_selectStocks(context,data)
+        s0_fix_weights(context,data)    
+    
+def s1_before_trading_start(context,data):
+    
+    context.s1_activateDC = 1
+    for i in range(0,context.s1_setnumber):
+        s1_KF(context,data,i)
+    for i in range(0,context.s1_setnumber):
+        if context.s1_squaring[i] == 1:
+            context.s1_squaring_unfinished[i] = 1
+            for j in range(0,len(context.s1_stk[i])):
+                context.s1_squaring_cost[i][j] = context.s1_squaring_cost[i][j] + get_order(context.s1_squaring_id[i][j]).commission
+    
+    
+    
+        
+#this function serves to update the positions and cost basis of the portfolio        
+def track_order(context, data, i):
+    
+    if (context.open_order[i] != []):   
+        for j in range(0,len(context.open_order[i])):
+            open_order = get_order(context.open_order[i][j])
+            if (open_order is not None):
+                if (context.order_update[i][j] != 0):
+                    last_filled = open_order.amount - context.order_update[i][j]
+                    shares_in = open_order.filled - last_filled
+                    #print "shares_in"
+                    #print shares_in
+                    cost = shares_in * data.current(context.order_stock[i][j],'price')
+                    context.order_update[i][j] = open_order.amount - open_order.filled
+                    new_commission = open_order.commission - context.track_commission[i][j]
+                    cost = cost + new_commission
+                    context.track_commission[i][j] = open_order.commission
+                    
+                    context.cash_account[i] = context.cash_account[i] - cost
+                
+                if (context.order_stock[i][j] in context.track_positions[i][0]):
+                    
+                    loc = context.track_positions[i][0].index(context.order_stock[i][j])
+                    context.track_positions[i][1][loc] = context.track_positions[i][1][loc] + shares_in
+                    context.track_positions[i][2][loc] = context.track_positions[i][2][loc] + cost
+                else:
+                    context.track_positions[i][0].append(context.order_stock[i][j])
+                   
+                    context.track_positions[i][1].append(open_order.filled)
+                    context.track_positions[i][2].append(cost)
+        remove = []
+        for j in range(0,len(context.open_order[i])):
+            
+            if (context.order_update[i][j] == 0):
+                remove.append(j)
+        pop = 0 
+        
+        for j in range(0,len(remove)):  
+            context.open_order[i].pop(remove[j]-pop)
+            context.order_update[i].pop(remove[j]-pop)
+            context.order_stock[i].pop(remove[j]-pop)
+            context.track_commission[i].pop(remove[j]-pop)
+            
+            pop = pop + 1 
+        
+    context.portfolio_values[i] = context.cash_account[i]
+    net_exposure = 0
+    for j in range(len(context.track_positions[i][0])):
+        context.portfolio_values[i] = context.portfolio_values[i] + data.current(context.track_positions[i][0][j],'price') * context.track_positions[i][1][j]
+        net_exposure = net_exposure + data.current(context.track_positions[i][0][j],'price') * np.absolute(context.track_positions[i][1][j])
+    context.track_leverage[i] = net_exposure / context.portfolio_values[i]
+        
+def make_order(context, data, order_method, sid, amount, OrderType, i):
+    if OrderType == 0:
+        OrderType = MarketOrder()
+    if (order_method is order):
+        my_order = order(sid, amount, style = OrderType)
+    elif (order_method is order_value):
+        my_order = order_value(sid, amount, style = OrderType)
+
+    elif (order_method is order_percent):
+        value = context.portfolio_values[i] * amount
+        my_order = order_value(sid, value, style = OrderType)
+    elif (order_method is order_target):
+        if (sid in context.track_positions[i][0]):    
+            loc = context.track_positions[i][0].index(sid)
+            target = amount - context.track_positions[i][1][loc]
+            my_order = order(sid, target, style = OrderType)
+        else: 
+            my_order = order(sid, amount, style = OrderType)
+    elif (order_method is order_target_value):
+        if (sid in context.track_positions[i][0]):    
+            loc = context.track_positions[i][0].index(sid)
+            holding_value = data.current(sid,'price')*context.track_positions[i][1][loc]
+            ordering_value = amount - holding_value
+            my_order = order_value(sid, ordering_value, style = OrderType)
+        else: 
+            my_order = order_value(sid, amount, style = OrderType)   
+    elif (order_method is order_target_percent):
+        if (sid in context.track_positions[i][0]):    
+            loc = context.track_positions[i][0].index(sid)
+            holding_value = data.current(sid,'price')*context.track_positions[i][1][loc]
+            ordering_value = amount*context.portfolio_values[i] - holding_value
+            my_order = order_value(sid, ordering_value, style = OrderType)
+        else:
+            my_order = order_value(sid, amount*context.portfolio_values[i])
+    else:
+        my_order = 0
+        print "error in ordering"
+    
+    
+    if (get_order(my_order) is not None): 
+        context.open_order[i].append(my_order)
+        context.order_update[i].append(get_order(my_order).amount)
+        context.order_stock[i].append(sid)
+        context.track_commission[i].append(0)
+    return my_order
+        
+def handle_data(context,data):
+    for i in range(strategynumber):
+        track_order(context,data,i)
+    s1_handle_data(context,data)
+    
+def s1_handle_data(context, data):
+    if context.s1_activateDC==1:
+        context.s1_dateCounter = context.s1_dateCounter+1
+        context.s1_activateDC=0
+    if context.s1_dateCounter > 0:
+        for i in range(0,context.s1_setnumber):
+            if context.s1_squaring[i] == 1:
+                if context.s1_squaring_unfinished[i] == 1:
+                    for j in range(0, len(context.s1_stk[i])):
+                        if context.s1_squaring_unfinished[i] == 1:
+                            #print context.s1_stk[i][j]
+                            #print context.s1_squaring_target[i][j]
+                            #print context.s1_stocks_filled[i][j]
+                            context.s1_squaring_target[i][j] = context.s1_squaring_target[i][j] - context.s1_stocks_filled[i][j]
+                            if context.s1_squaring_target[i][j] != 0:
+                                #print context.s1_squaring_target[i][j]
+                                context.s1_squaring_id[i][j] = order_target_percent(context.s1_stk[i][j],0)
+                                #print context.s1_squaring_id[i][j]
+                            context.s1_stocks_filled[i][j] = 0 
+                    context.s1_squaring_unfinished[i] = 0
+                    
+                for j in range(0, len(context.s1_stk[i])):  
+                    #print context.s1_squaring_id[i][j]
+                    if context.s1_squaring_finished[i][j] == 0:
+                        new_order = get_order(context.s1_squaring_id[i][j]).filled - context.s1_stocks_filled[i][j]
+                        new_cost = data.current(context.s1_stk[i][j], 'price') * new_order
+                        context.s1_stocks_filled[i][j] = get_order(context.s1_squaring_id[i][j]).filled
+                        context.s1_squaring_cost[i][j] = context.s1_squaring_cost[i][j] + new_cost
+                        if get_order(context.s1_squaring_id[i][j]).filled == context.s1_squaring_target[i][j]:
+                            context.s1_squaring_finished[i][j] = 1
+                        
+                if context.s1_squaring_finished[i] == [1,1,1]:
+                    s1_finish_squaring(context,data,i)
+            else:
+                if context.s1_uncertain[i] == 0:
+                    exchange_time = get_datetime().astimezone(pytz.timezone('US/Eastern'))
+                    if exchange_time.hour < 15:
+                        if exchange_time.hour >= 9:
+                            s1_find_signal(context,data,i)
+
+def s0_selectStocks(context,data):
+    #Isolating the assets to trade
+    allSUSIR                        = [data.current(x,'susir') for x in data.fetcher_assets]
+    assetTrade                      = [x for (y,x) in sorted(zip(allSUSIR,data.fetcher_assets))]
+    context.s0_toTrade.shortStockSID   = assetTrade[:context.s0_shortStockNum]
+    context.s0_toTrade.longStockSID    = assetTrade[-context.s0_longStockNum:]
+    
+
+def s0_rebalance(context,data):
+    if (context.s0_counters.day%context.s0_daysPerUpdate == 0):
+        #Liquidate everything first according to the number of shares
+        pF    = context.s0_rotPFs[context.s0_pfToUpdate] 
+        for idx, security in enumerate(pF.longStockSID):
+            make_order(context, data, order, security, -pF.numLongPos[idx], 0, 0)
+        for idx, security in enumerate(pF.shortStockSID):
+            make_order(context, data, order, security, -pF.numShortPos[idx], 0, 0)
+    
+        #Reform the portfolio and construct orderIDs for obtaining shares ordered
+        for idx, security in enumerate(context.s0_toTrade.longStockSID):
+            if data.can_trade(security):
+                context.s0_longOrderID[idx] = make_order(context, data, order_value, security, context.s0_longOverShort*context.s0_toTrade.tradeVal/float(context.s0_longStockNum), 0, 0) 
+                context.s0_rotPFs[context.s0_pfToUpdate].longStockSID[idx] = security
+            else:
+                context.s0_longOrderID[idx] = make_order(context, data, order_value, sid(8554), 0, 0, 0) 
+        for idx, security in enumerate(context.s0_toTrade.shortStockSID):
+            if data.can_trade(security):
+                context.s0_shortOrderID[idx] = make_order(context, data, order_value, security, -(1-context.s0_longOverShort)*context.s0_toTrade.tradeVal/float(context.s0_shortStockNum), 0, 0)                                         
+                context.s0_rotPFs[context.s0_pfToUpdate].shortStockSID[idx] = security
+            else:
+                context.s0_shortOrderID[idx] = make_order(context, data, order_value, sid(8554), 0, 0, 0) 
+            
+def s0_fix_weights(context,data):
+    context.s0_toTrade.tradeVal   = context.s0_pfSizeScale*context.portfolio_values[0]/float(context.s0_numberOfPF)
+
+    
+    
+def s0_check_end_of_day_position(context,data):
+    if (context.s0_counters.day%context.s0_daysPerUpdate == 0):
+        
+        for idx, orders in enumerate(context.s0_longOrderID):
+            bla = get_order(orders)
+            #If trying to order a dropped asset, it will go to none.
+            if (bla is not None):
+                context.s0_rotPFs[context.s0_pfToUpdate].numLongPos[idx] = bla.filled
+                cancel_order(orders)
+            else:
+                context.s0_rotPFs[context.s0_pfToUpdate].numLongPos[idx] = 0
+            
+    
+        for idx, orders in enumerate(context.s0_shortOrderID):
+            bla = get_order(orders)
+            if (bla is not None):
+                context.s0_rotPFs[context.s0_pfToUpdate].numShortPos[idx] = bla.filled
+                cancel_order(orders)
+            else:
+                context.s0_rotPFs[context.s0_pfToUpdate].numShortPos[idx] = 0
+
+        x = context.s0_pfToUpdate
+        log.info("Updated portfolio "+str(x))
+        print("Long Positions")
+        print([y.symbol for y in context.s0_rotPFs[x].longStockSID]) 
+        print(context.s0_rotPFs[x].numLongPos)
+        print("Short Positions")
+        print([y.symbol for y in context.s0_rotPFs[x].shortStockSID])
+        print(context.s0_rotPFs[x].numShortPos)                
+                
+        context.s0_pfToUpdate = (context.s0_pfToUpdate + 1)%context.s0_numberOfPF
+        
+#UTILITIES
+class s0_dotDict:
+    #This class allows .notation for organizing data in context
+    def __init__(self):
+        pass
+        
+def s0_time_lag(df):
+    # using pandas' tshift shift index by N days
+    # e.g. March 23rd will become March 24th.
+    N  = 1
+    df = df.tshift(N, freq='b')
+    #previewFetch(df)
+    return df
+
+def s0_previewFetch(df):
+    log.info('Previewing the fetched CSV file')
+    log.info(df.tail())
+    return df    
+
+def s0_closeAnyOpenOrders(stock):  
+    orders = get_open_orders(stock)  
+    if orders:  
+        for order in orders:  
+             message = 'Canceling order for {amount} shares in {stock}'  
+             message = message.format(amount=order.amount, stock=stock)  
+             #log.debug(message)  
+             cancel_order(order)
+
+def s1_KF(context,data,i):
+    x = np.hstack([[data.current(sec, 'price') for sec in context.s1_x[i]], 1.0]).reshape((1, context.s1_n_dim_state))
+    y = data.current(context.s1_y[i], 'price')
+    # update Kalman filter with latest price
+    if context.s1_R[i] is not None:
+        context.s1_R[i] = context.s1_P[i] + context.s1_Vw
+    else:
+        context.s1_R[i] = np.zeros((context.s1_n_dim_state, context.s1_n_dim_state))
+
+    yhat = x.dot(context.s1_beta[i])
+    Q = x.dot(context.s1_R[i]).dot(x.T) + context.s1_Ve
+    sqrt_Q = np.sqrt(Q)
+    sqrt_Q = sqrt_Q[0][0]
+    context.s1_sqrt_Q[i] = sqrt_Q
+    e = y - yhat
+    K = context.s1_R[i].dot(x.T) / Q
+    beta = context.s1_beta[i] + K.flatten() * e
+    context.s1_beta[i] = beta.tolist()
+    context.s1_rollingbeta1[i][4] = context.s1_rollingbeta1[i][3]
+    context.s1_rollingbeta1[i][3] = context.s1_rollingbeta1[i][2]
+    context.s1_rollingbeta1[i][2] = context.s1_rollingbeta1[i][1]
+    context.s1_rollingbeta1[i][1] = context.s1_rollingbeta1[i][0]
+    context.s1_rollingbeta1[i][0] = context.s1_beta[i][0]
+    context.s1_rollingbeta2[i][4] = context.s1_rollingbeta2[i][3]
+    context.s1_rollingbeta2[i][3] = context.s1_rollingbeta2[i][2]
+    context.s1_rollingbeta2[i][2] = context.s1_rollingbeta2[i][1]
+    context.s1_rollingbeta2[i][1] = context.s1_rollingbeta2[i][0]
+    context.s1_rollingbeta2[i][0] = context.s1_beta[i][1]  
+    context.s1_beta1std[i] = np.std(context.s1_rollingbeta1[i])
+    context.s1_beta2std[i] = np.std(context.s1_rollingbeta2[i])
+    
+    context.s1_P[i] = context.s1_R[i] - K * x.dot(context.s1_R[i])
+    if context.s1_uncertain[i] == 1:
+        if (context.s1_beta1std[i] < 0.02) & (context.s1_beta2std[i] < 0.02):
+            context.s1_uncertain[i] = 0 
+    #print context.s1_beta    
+        
+def s1_find_signal(context, data, i):
+    if context.s1_open_finished[i] == 0:
+        open_order_sum = 0 
+        for sec in context.s1_stk[i]:
+            open_order_sum = open_order_sum + len(get_open_orders(sec))
+        if open_order_sum == 0:
+            context.s1_open_finished[i] = 1
+            print "portfolio {} {} position opened".format(i+1, context.s1_pos[i])
+            for j in range(0,len(context.s1_stk[i])):
+                loc = context.track_positions[1][0].index(context.s1_stk[i][j])
+                
+                context.s1_costbasis[i][j] = context.track_positions[1][2][loc] / context.track_positions[1][1][loc]
+                context.s1_cashpos[i] = context.s1_cashpos[i] - context.s1_costbasis[i][j]    
+            
+        #print "open order left", open_order_sum    
+    else:
+            
+        y = data.current(context.s1_y[i], 'price')
+        x = [data.current(sec, 'price') for sec in context.s1_x[i]]
+        spread = y - x[0] * context.s1_beta[i][0] - x[1] * context.s1_beta[i][1] - context.s1_beta[i][2]
+        #when there is no position, check for signals
+        if context.s1_pos[i] == "none":
+            if (spread < -0.5*context.s1_sqrt_Q[i]):
+                context.s1_pos[i] = 'long'
+                s1_my_long(context,data,i)
+                
+                #print spread
+                #consider linear strategy
+            elif (spread > 0.5*context.s1_sqrt_Q[i]):    
+                context.s1_pos[i] = 'short'
+                s1_my_short(context,data,i)
+                #print spread
+
+        elif context.s1_pos[i] == "long":
+            loc1 = context.track_positions[1][0].index(context.s1_stk[i][0])
+            loc2 = context.track_positions[1][0].index(context.s1_stk[i][1])
+            loc3 = context.track_positions[1][0].index(context.s1_stk[i][2])
+            portpos = context.track_positions[1][1][loc1]*data.current(context.s1_stk[i][0], 'price') + context.track_positions[1][1][loc2]*data.current(context.s1_stk[i][1], 'price') + context.track_positions[1][1][loc3]*data.current(context.s1_stk[i][2], 'price') + context.s1_cashpos[i]
+            PL = portpos - context.s1_portpos[i]
+            if PL < context.s1_stoploss[i]:
+                context.s1_stoplossCount[i] = context.s1_stoplossCount[i] + 1 
+                print "portfolio {} stoploss {}".format(i+1, context.s1_stoplossCount[i])
+                if (context.s1_beta1std[i] > 0.03) or (context.s1_beta2std[i] > 0.03):
+                    context.s1_uncertain[i] = 1 
+                    context.s1_stoplossCount[i] = 0
+                    
+                    s1_start_squaring(context,data,i)
+                 
+
+                if context.s1_stoplossCount[i] > 390:
+                    if (context.s1_beta1std[i] > 0.01) or (context.s1_beta2std[i] > 0.01):
+                        context.s1_uncertain[i] = 1 
+                        context.s1_stoplossCount[i] = 0
+
+                        s1_start_squaring(context,data,i)
+                     
+                        
+            elif spread > 0:
+                context.s1_stoplossCount[i] = 0
+                s1_start_squaring(context,data,i)
+         
+        elif context.s1_pos[i] == "short":
+            loc1 = context.track_positions[1][0].index(context.s1_stk[i][0])
+            loc2 = context.track_positions[1][0].index(context.s1_stk[i][1])
+            loc3 = context.track_positions[1][0].index(context.s1_stk[i][2])
+            portpos = context.track_positions[1][1][loc1]*data.current(context.s1_stk[i][0], 'price') + context.track_positions[1][1][loc2]*data.current(context.s1_stk[i][1], 'price') + context.track_positions[1][1][loc3]*data.current(context.s1_stk[i][2], 'price') + context.s1_cashpos[i]
+            PL = portpos - context.s1_portpos[i]
+            if PL < context.s1_stoploss[i]:
+                context.s1_stoplossCount[i] = context.s1_stoplossCount[i] + 1 
+                print "portfolio {} stoploss {}".format(i+1, context.s1_stoplossCount[i])
+                if (context.s1_beta1std[i] > 0.03) or (context.s1_beta2std[i] > 0.03):
+                    context.s1_uncertain[i] = 1 
+                    context.s1_stoplossCount[i] = 0
+
+                    s1_start_squaring(context,data,i)
+              
+                if context.s1_stoplossCount[i] > 390:
+                    if (context.s1_beta1std[i] > 0.01) or (context.s1_beta2std[i] > 0.01):
+                        context.s1_uncertain[i] = 1 
+                        context.s1_stoplossCount[i] = 0
+                        s1_start_squaring(context,data,i)
+               
+
+            elif spread < 0:
+                context.s1_stoplossCount[i] = 0
+                s1_start_squaring(context,data,i)
+       
+
+
+                   
+def s1_start_squaring(context, data, i):
+    context.s1_squaring[i] = 1 
+    for j in range(0,len(context.s1_stk[i])):
+        loc = context.track_positions[1][0].index(context.s1_stk[i][j])
+        context.s1_squaring_target[i][j] = -1* context.track_positions[1][1][loc]
+        context.s1_squaring_id[i][j] = make_order(context, data, order_target_percent, context.s1_stk[i][j], 0, 0, 1)
+        context.s1_squaring_finished[i][j] = 0
+    print "starting to square portfolio {}".format(i+1)
+    
+
+def s1_finish_squaring(context,data,i):
+    for j in range(0, len(context.s1_stk[i])):
+        context.s1_squaring_cost[i][j] = context.s1_squaring_cost[i][j] + get_order(context.s1_squaring_id[i][j]).commission
+        context.s1_cashpos[i] = context.s1_cashpos[i] - context.s1_squaring_cost[i][j]
+        context.s1_squaring_cost[i][j] = 0
+        context.s1_squaring_target[i][j] = 0
+        context.s1_stocks_filled[i][j] = 0
+    context.s1_PL[i] = context.s1_cashpos[i] - context.s1_portpos[i]
+#    cycle_return = context.s1_PL[i] / context.s1_portpos[i]
+    context.s1_cycle_return[i] = context.s1_PL[i] / context.s1_portpos[i]
+    context.s1_portpos[i] = context.s1_cashpos[i]
+    context.s1_cumulative_return[i] = context.s1_portpos[i] / (context.initial_cash / context.s1_setnumber) - 1 
+    
+    context.s1_squaring[i] = 0
+    print "portfolio {} {} position squared, returned {:.1%} this cycle, {:.1%} cumulatively.".format(i+1,context.s1_pos[i],context.s1_cycle_return[i], context.s1_cumulative_return[i])
+    context.s1_pos[i] = "none"    
+
+def s1_my_long(context,data,i):
+    print "longing set {}".format(i+1)
+    context.s1_open_finished[i] = 0
+    y = data.current(context.s1_y[i], 'price')
+    x = [data.current(sec, 'price') for sec in context.s1_x[i]]
+    spread = y - x[0] * context.s1_beta[i][0] - x[1] * context.s1_beta[i][1] - context.s1_beta[i][2]
+    ratio = spread / context.s1_sqrt_Q[i]
+    ratio = np.absolute(ratio)
+    #print "ratio1"
+    #print ratio
+    ratio = np.amin([0.5*ratio,0.5])
+    #print "ratio capped"
+    #print ratio
+    if (context.s1_beta[i][0] >0) & (context.s1_beta[i][1] > 0):
+       # print "case1"
+    
+        make_order(context, data, order_target_value, context.s1_y[i], ratio*context.s1_portpos[i], 0, 1)
+        stock1T = context.s1_beta[i][0]*data.current(context.s1_x[i][0], 'price')
+        stock2T = context.s1_beta[i][1]*data.current(context.s1_x[i][1], 'price')
+        stock1percent = stock1T/(stock1T + stock2T + context.s1_beta[i][2])
+        stock2percent = stock2T/(stock1T + stock2T + context.s1_beta[i][2])
+        """
+        context.s1_stk1pos[i] = ratio*context.s1_portpos[i]
+        context.s1_stk2pos[i] = -1*ratio*stock1percent*context.s1_portpos[i] 
+        context.s1_stk3pos[i] = -1*ratio*stock2percent*context.s1_portpos[i]
+        context.s1_cashpos[i] = context.s1_portpos[i] - context.s1_stk1pos[i] - context.s1_stk2pos[i] - context.s1_stk3pos[i]
+        """
+        context.s1_stoploss[i] = -0.05 * context.s1_portpos[i]
+        make_order(context, data, order_target_value, context.s1_x[i][0], -1*ratio*stock1percent*context.s1_portpos[i], 0, 1)
+        make_order(context, data, order_target_value, context.s1_x[i][1], -1*ratio*stock2percent*context.s1_portpos[i], 0, 1)
+       
+    elif (context.s1_beta[i][0] >0) & (context.s1_beta[i][1] < 0):
+       # print "case2"
+        make_order(context, data, order_target_value, context.s1_x[i][0], -1*ratio*context.s1_portpos[i], 0, 1)
+        yT = data.current(context.s1_y[i], 'price')
+        stock2T = context.s1_beta[i][1]*data.current(context.s1_x[i][1], 'price')
+        ypercent = yT/(yT - stock2T - context.s1_beta[i][2])
+        stock2percent = -1 * stock2T/(yT - stock2T - context.s1_beta[i][2])
+        
+        context.s1_stoploss[i] = -0.05 * context.s1_portpos[i]
+        
+        make_order(context,data, order_target_value, context.s1_x[i][1], ratio*stock2percent*context.s1_portpos[i], 0, 1)
+        make_order(context, data, order_target_value, context.s1_y[i], ratio*ypercent*context.s1_portpos[i], 0, 1)
+
+    elif (context.s1_beta[i][0] <0) & (context.s1_beta[i][1] > 0):
+        #print "case3"
+        make_order(context, data, order_target_value, context.s1_x[i][1], -1*ratio, 0, 1)
+        yT = data.current(context.s1_y[i], 'price')
+        stock1T = context.s1_beta[i][0]*data.current(context.s1_x[i][0], 'price')
+        ypercent = yT/(yT - stock1T - context.s1_beta[i][2])
+        stock1percent = -1* stock1T/(yT - stock1T - context.s1_beta[i][2])
+        """
+        context.s1_stk1pos[i] = ratio*ypercent*context.s1_portpos[i]
+        context.s1_stk2pos[i] = 1*ratio*stock1percent*context.s1_portpos[i]
+        context.s1_stk3pos[i] = -1*ratio*context.s1_portpos[i]
+        
+        context.s1_cashpos[i] = context.s1_portpos[i] - context.s1_stk1pos[i] - context.s1_stk2pos[i] - context.s1_stk3pos[i]
+        """
+        context.s1_stoploss[i] = -0.05 * context.s1_portpos[i]
+        make_order(context, data, order_target_value, context.s1_x[i][0], ratio*stock1percent*context.s1_portpos[i], 0, 1)
+        make_order(context, data, order_target_value, context.s1_y[i], ratio*ypercent*context.s1_portpos[i], 0, 1)   
+    
+ 
+def s1_my_short(context,data,i):    
+    print "shorting set {}".format(i+1)
+    context.s1_open_finished[i] = 0
+    y = data.current(context.s1_y[i], 'price')
+    x = [data.current(sec, 'price') for sec in context.s1_x[i]]
+    spread = y - x[0] * context.s1_beta[i][0] - x[1] * context.s1_beta[i][1] - context.s1_beta[i][2]
+    ratio = spread / context.s1_sqrt_Q[i]
+    ratio = np.absolute(ratio)
+    #print "ratio1"
+    #print ratio
+    ratio = np.amin([0.5*ratio,0.5])
+    #print "ratio capped"
+    #print ratio
+    if (context.s1_beta[i][0] >0) & (context.s1_beta[i][1] > 0):
+       # print "case1"
+    
+        make_order(context, data, order_target_value, context.s1_y[i], -1*ratio*context.s1_portpos[i], 0, 1)
+        stock1T = context.s1_beta[i][0]*data.current(context.s1_x[i][0], 'price')
+        stock2T = context.s1_beta[i][1]*data.current(context.s1_x[i][1], 'price')
+        stock1percent = stock1T/(stock1T + stock2T + context.s1_beta[i][2])
+        stock2percent = stock2T/(stock1T + stock2T + context.s1_beta[i][2])
+        """
+        context.s1_stk1pos[i] = ratio*context.s1_portpos[i]
+        context.s1_stk2pos[i] = -1*ratio*stock1percent*context.s1_portpos[i] 
+        context.s1_stk3pos[i] = -1*ratio*stock2percent*context.s1_portpos[i]
+        context.s1_cashpos[i] = context.s1_portpos[i] - context.s1_stk1pos[i] - context.s1_stk2pos[i] - context.s1_stk3pos[i]
+        """
+        context.s1_stoploss[i] = -0.05 * context.s1_portpos[i]
+        make_order(context, data, order_target_value, context.s1_x[i][0], 1*ratio*stock1percent*context.s1_portpos[i], 0, 1)
+        make_order(context, data, order_target_value, context.s1_x[i][1], 1*ratio*stock2percent*context.s1_portpos[i], 0, 1)
+       
+    elif (context.s1_beta[i][0] >0) & (context.s1_beta[i][1] < 0):
+       # print "case2"
+        make_order(context, data, order_target_value, context.s1_x[i][0], ratio*context.s1_portpos[i], 0, 1)
+        yT = data.current(context.s1_y[i], 'price')
+        stock2T = context.s1_beta[i][1]*data.current(context.s1_x[i][1], 'price')
+        ypercent = yT/(yT - stock2T - context.s1_beta[i][2])
+        stock2percent = -1 * stock2T/(yT - stock2T - context.s1_beta[i][2])
+        
+        context.s1_stoploss[i] = -0.05 * context.s1_portpos[i]
+        
+        make_order(context,data, order_target_value, context.s1_x[i][1], -1*ratio*stock2percent*context.s1_portpos[i], 0, 1)
+        make_order(context, data, order_target_value, context.s1_y[i], -1*ratio*ypercent*context.s1_portpos[i], 0, 1)
+
+    elif (context.s1_beta[i][0] <0) & (context.s1_beta[i][1] > 0):
+        #print "case3"
+        make_order(context, data, order_target_value, context.s1_x[i][1], ratio*context.s1_portpos[i], 0, 1)
+        yT = data.current(context.s1_y[i], 'price')
+        stock1T = context.s1_beta[i][0]*data.current(context.s1_x[i][0], 'price')
+        ypercent = yT/(yT - stock1T - context.s1_beta[i][2])
+        stock1percent = -1* stock1T/(yT - stock1T - context.s1_beta[i][2])
+        """
+        context.s1_stk1pos[i] = ratio*ypercent*context.s1_portpos[i]
+        context.s1_stk2pos[i] = 1*ratio*stock1percent*context.s1_portpos[i]
+        context.s1_stk3pos[i] = -1*ratio*context.s1_portpos[i]
+        
+        context.s1_cashpos[i] = context.s1_portpos[i] - context.s1_stk1pos[i] - context.s1_stk2pos[i] - context.s1_stk3pos[i]
+        """
+        context.s1_stoploss[i] = -0.05 * context.s1_portpos[i]
+        make_order(context, data, order_target_value, context.s1_x[i][0], -1*ratio*stock1percent*context.s1_portpos[i], 0, 1)
+        make_order(context, data, order_target_value, context.s1_y[i], -1*ratio*ypercent*context.s1_portpos[i], 0, 1)   
+  
+        
+        
