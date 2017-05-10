@@ -88,7 +88,6 @@ def before_trading_start(context,data):
     
     print context.context[0].portfolio.cash
     print context.context[1].portfolio.cash
-    s0_before_trading_start(context,data)
     s1_before_trading_start(context,data)
     
 def handle_data(context,data):
