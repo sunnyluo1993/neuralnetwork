@@ -1,0 +1,397 @@
+"""
+This is a template algorithm on Quantopian for you to adapt and fill in.
+"""
+from quantopian.algorithm import attach_pipeline, pipeline_output
+from quantopian.pipeline import Pipeline
+from quantopian.pipeline.data.builtin import USEquityPricing
+from quantopian.pipeline.factors import AverageDollarVolume
+from quantopian.pipeline.filters.morningstar import Q1500US
+import numpy as np
+import pytz
+
+
+def initialize(context):
+    context.setnumber = 3 
+    context.stk = [[sid(3443),sid(33856),sid(8329)], [sid(2621),sid(2368),sid(8306)],[sid(24833),sid(5213),sid(16108)]]
+    context.n_dim_state = 3
+    context.y = []
+    context.x = []
+    context.beta = []
+    context.rollingbeta1 = []
+    context.rollingbeta2 = []
+    context.P = []
+    context.R = []
+    context.sqrt_Q = []
+    context.pos = []
+    context.open_finished = []
+    context.PL = []
+    context.cashpos = []
+    context.portpos = []
+    context.cycle_return = []
+    context.cumulative_return = []
+    context.squaring = []
+    context.squaring_target = []
+    context.squaring_id = []
+    context.costbasis = []
+    context.stocks_filled = []
+    context.squaring_cost = []
+    context.squaring_finished = []
+    context.squaring_unfinished = []
+    context.stoploss = []
+    context.stoplossCount = []
+    context.uncertain = []
+    context.beta1std = []
+    context.beta2std = []
+    
+    for i in range(0,context.setnumber):
+        context.y.append(context.stk[i][0])
+        x = []
+        x.append(context.stk[i][1])
+        x.append(context.stk[i][2])
+        context.x.append(x)
+        context.rollingbeta1.append([0,0,0,0,0])
+        context.rollingbeta2.append([0,0,0,0,0])
+        P = np.zeros((context.n_dim_state, context.n_dim_state))
+        context.P.append(P)
+        R = None
+        context.R.append(R)
+        context.sqrt_Q.append(0)
+        pos = "none"
+        context.pos.append(pos)
+        context.open_finished.append(1)
+        cashpos = context.portfolio.starting_cash / context.setnumber
+        portpos = context.portfolio.starting_cash / context.setnumber
+        context.PL.append(0)
+        context.cashpos.append(cashpos)
+        context.portpos.append(portpos)
+        context.cycle_return.append([0,0,0])
+        context.cumulative_return.append([0,0,0])
+        context.stoploss.append(0)
+        context.stoplossCount.append(0)
+        context.squaring.append(0)
+        context.squaring_target.append([0,0,0])
+        context.squaring_id.append([0,0,0])
+        context.costbasis.append([0,0,0])
+        context.stocks_filled.append([0,0,0])
+        context.squaring_cost.append([0,0,0])
+        context.squaring_finished.append([1,1,1])
+        context.squaring_unfinished.append(0)
+        context.uncertain.append(0)
+        context.beta1std.append(0)
+        context.beta2std.append(0)
+        
+                       
+    
+    #delta will decide the value of the covariance of the transition noise
+    context.delta = 0.0001
+    #Vw is the covariance of the transition noise 
+    context.Vw = context.delta / (1 - context.delta) * np.eye(context.n_dim_state)
+    #Ve is the covariance of the measurement noise
+    context.Ve = 0.25
+    
+    
+    context.beta = [[0.87, 0.27, 0.25],[0.34, -0.13, 0.23],[0.99, 0.48, 0.26]]
+
+    context.day = None
+    context.dateCounter = 0
+    context.activateDC = 0
+
+def kf(context,data,i):
+    x = np.hstack([[data.current(sec, 'price') for sec in context.x[i]], 1.0]).reshape((1, context.n_dim_state))
+    y = data.current(context.y[i], 'price')
+    # update Kalman filter with latest price
+    if context.R[i] is not None:
+        context.R[i] = context.P[i] + context.Vw
+    else:
+        context.R[i] = np.zeros((context.n_dim_state, context.n_dim_state))
+
+    yhat = x.dot(context.beta[i])
+    Q = x.dot(context.R[i]).dot(x.T) + context.Ve
+    sqrt_Q = np.sqrt(Q)
+    sqrt_Q = sqrt_Q[0][0]
+    context.sqrt_Q[i] = sqrt_Q
+    e = y - yhat
+    K = context.R[i].dot(x.T) / Q
+    beta = context.beta[i] + K.flatten() * e
+    context.beta[i] = beta.tolist()
+    context.rollingbeta1[i][4] = context.rollingbeta1[i][3]
+    context.rollingbeta1[i][3] = context.rollingbeta1[i][2]
+    context.rollingbeta1[i][2] = context.rollingbeta1[i][1]
+    context.rollingbeta1[i][1] = context.rollingbeta1[i][0]
+    context.rollingbeta1[i][0] = context.beta[i][0]
+    context.rollingbeta2[i][4] = context.rollingbeta2[i][3]
+    context.rollingbeta2[i][3] = context.rollingbeta2[i][2]
+    context.rollingbeta2[i][2] = context.rollingbeta2[i][1]
+    context.rollingbeta2[i][1] = context.rollingbeta2[i][0]
+    context.rollingbeta2[i][0] = context.beta[i][1]  
+    context.beta1std[i] = np.std(context.rollingbeta1[i])
+    context.beta2std[i] = np.std(context.rollingbeta2[i])
+    
+    context.P[i] = context.R[i] - K * x.dot(context.R[i])
+    if context.uncertain[i] == 1:
+        if (context.beta1std[i] < 0.02) & (context.beta2std[i] < 0.02):
+            context.uncertain[i] = 0 
+    #print context.beta    
+
+def before_trading_start(context,data):
+    
+    context.activateDC = 1
+    for i in range(0,context.setnumber):
+        kf(context,data,i)
+    for i in range(0,context.setnumber):
+        if context.squaring[i] == 1:
+            context.squaring_unfinished[i] = 1
+            for j in range(0,len(context.stk[i])):
+                context.squaring_cost[i][j] = context.squaring_cost[i][j] + get_order(context.squaring_id[i][j]).commission
+    
+    record(s1_returns = context.portfolio.returns)
+
+                
+        
+def find_signal(context, data, i):
+    if context.open_finished[i] == 0:
+        open_order_sum = 0 
+        for sec in context.stk[i]:
+            open_order_sum = open_order_sum + len(get_open_orders(sec))
+        if open_order_sum == 0:
+            context.open_finished[i] = 1
+            print "portfolio {} {} position opened".format(i+1, context.pos[i])
+            for j in range(0,len(context.stk[i])):        
+                context.costbasis[i][j] = context.portfolio.positions[context.stk[i][j]].amount*context.portfolio.positions[context.stk[i][j]].cost_basis
+                context.cashpos[i] = context.cashpos[i] - context.costbasis[i][j]    
+            
+        #print "open order left", open_order_sum    
+    else:
+        y = data.current(context.y[i], 'price')
+        x = [data.current(sec, 'price') for sec in context.x[i]]
+        spread = y - x[0] * context.beta[i][0] - x[1] * context.beta[i][1] - context.beta[i][2]
+        #when there is no position, check for signals
+        if context.pos[i] == "none":
+            if (spread < -0.5*context.sqrt_Q[i]):
+                context.pos[i] = 'long'
+                my_long(context,data,i)
+                
+                #print spread
+                #consider linear strategy
+            elif (spread > 0.5*context.sqrt_Q[i]):    
+                context.pos[i] = 'short'
+                my_short(context,data,i)
+                #print spread
+
+        if context.pos[i] == "long":
+            portpos = context.portfolio.positions[context.stk[i][0]].amount*data.current(context.stk[i][0], 'price') + context.portfolio.positions[context.stk[i][1]].amount*data.current(context.stk[i][1], 'price') + context.portfolio.positions[context.stk[i][2]].amount*data.current(context.stk[i][2], 'price') + context.cashpos[i]
+            PL = portpos - context.portpos[i]
+            if PL < context.stoploss[i]:
+                context.stoplossCount[i] = context.stoplossCount[i] + 1 
+                print "portfolio {} stoploss {}".format(i+1, context.stoplossCount[i])
+                if (context.beta1std[i] > 0.03) or (context.beta2std[i] > 0.03):
+                    context.uncertain[i] = 1 
+                    context.stoplossCount[i] = 0
+                    
+                    start_squaring(context,data,i)
+                 
+
+                if context.stoplossCount[i] > 390:
+                    if (context.beta1std[i] > 0.01) or (context.beta2std[i] > 0.01):
+                        context.uncertain[i] = 1 
+                        context.stoplossCount[i] = 0
+
+                        start_squaring(context,data,i)
+                     
+                        
+            elif spread > 0:
+                context.stoplossCount[i] = 0
+                start_squaring(context,data,i)
+         
+        if context.pos[i] == "short":
+            portpos = context.portfolio.positions[context.stk[i][0]].amount*data.current(context.stk[i][0], 'price') + context.portfolio.positions[context.stk[i][1]].amount*data.current(context.stk[i][1], 'price') + context.portfolio.positions[context.stk[i][2]].amount*data.current(context.stk[i][2], 'price') + context.cashpos[i]
+            PL = portpos - context.portpos[i]
+            if PL < context.stoploss[i]:
+                context.stoplossCount[i] = context.stoplossCount[i] + 1 
+                print "portfolio {} stoploss {}".format(i+1, context.stoplossCount[i])
+                if (context.beta1std[i] > 0.03) or (context.beta2std[i] > 0.03):
+                    context.uncertain[i] = 1 
+                    context.stoplossCount[i] = 0
+
+                    start_squaring(context,data,i)
+              
+                if context.stoplossCount[i] > 390:
+                    if (context.beta1std[i] > 0.01) or (context.beta2std[i] > 0.01):
+                        context.uncertain[i] = 1 
+                        context.stoplossCount[i] = 0
+                        start_squaring(context,data,i)
+               
+
+            elif spread < 0:
+                context.stoplossCount[i] = 0
+                start_squaring(context,data,i)
+       
+
+
+                   
+def start_squaring(context, data, i):
+    context.squaring[i] = 1 
+    for j in range(0,len(context.stk[i])):        
+        context.squaring_target[i][j] = -1* context.portfolio.positions[context.stk[i][j]].amount
+        context.squaring_id[i][j] = order_target_percent(context.stk[i][j],0)
+        context.squaring_finished[i][j] = 0
+    print "starting to square portfolio {}".format(i+1)
+    
+
+def finish_squaring(context,data,i):
+    for j in range(0, len(context.stk[i])):
+        context.squaring_cost[i][j] = context.squaring_cost[i][j] + get_order(context.squaring_id[i][j]).commission
+        context.cashpos[i] = context.cashpos[i] - context.squaring_cost[i][j]
+        context.squaring_cost[i][j] = 0
+        context.squaring_target[i][j] = 0
+        context.stocks_filled[i][j] = 0
+    context.PL[i] = context.cashpos[i] - context.portpos[i]
+#    cycle_return = context.PL[i] / context.portpos[i]
+    context.cycle_return[i] = context.PL[i] / context.portpos[i]
+    context.portpos[i] = context.cashpos[i]
+    context.cumulative_return[i] = context.portpos[i] / (context.portfolio.starting_cash / context.setnumber) - 1 
+    
+    context.squaring[i] = 0
+    print "portfolio {} {} position squared, returned {:.1%} this cycle, {:.1%} cumulatively.".format(i+1,context.pos[i],context.cycle_return[i], context.cumulative_return[i])
+    context.pos[i] = "none"
+    
+        
+
+    
+
+def handle_data(context, data):
+    if context.activateDC==1:
+        context.dateCounter = context.dateCounter+1
+        context.activateDC=0
+    if context.dateCounter > 0:
+        for i in range(0,context.setnumber):
+            if context.squaring[i] == 1:
+                if context.squaring_unfinished[i] == 1:
+                    for j in range(0, len(context.stk[i])):
+                        if context.squaring_unfinished[i] == 1:
+                            #print context.stk[i][j]
+                            #print context.squaring_target[i][j]
+                            #print context.stocks_filled[i][j]
+                            context.squaring_target[i][j] = context.squaring_target[i][j] - context.stocks_filled[i][j]
+                            if context.squaring_target[i][j] != 0:
+                                #print context.squaring_target[i][j]
+                                context.squaring_id[i][j] = order_target_percent( context.stk[i][j], 0)
+                                #print context.squaring_id[i][j]
+                            context.stocks_filled[i][j] = 0 
+                    context.squaring_unfinished[i] = 0
+                    
+                for j in range(0, len(context.stk[i])):  
+                    #print context.squaring_id[i][j]
+                    if context.squaring_finished[i][j] == 0:
+                        new_order = get_order(context.squaring_id[i][j]).filled - context.stocks_filled[i][j]
+                        new_cost = data.current(context.stk[i][j], 'price') * new_order
+                        context.stocks_filled[i][j] = get_order(context.squaring_id[i][j]).filled
+                        context.squaring_cost[i][j] = context.squaring_cost[i][j] + new_cost
+                        if get_order(context.squaring_id[i][j]).filled == context.squaring_target[i][j]:
+                            context.squaring_finished[i][j] = 1
+                        
+                if context.squaring_finished[i] == [1,1,1]:
+                    finish_squaring(context,data,i)
+            else:
+                if context.uncertain[i] == 0:
+                    exchange_time = get_datetime().astimezone(pytz.timezone('US/Eastern'))
+                    if exchange_time.hour < 15:
+                        if exchange_time.hour >= 9:
+                            find_signal(context,data,i)
+
+
+def my_long(context,data,i):
+    print "longing set {}".format(i+1)
+    context.open_finished[i] = 0
+    y = data.current(context.y[i], 'price')
+    x = [data.current(sec, 'price') for sec in context.x[i]]
+    spread = y - x[0] * context.beta[i][0] - x[1] * context.beta[i][1] - context.beta[i][2]
+    ratio = spread / context.sqrt_Q[i]
+    ratio = np.absolute(ratio)
+    #print "ratio1"
+    #print ratio
+    ratio = np.amin([0.5*ratio,0.5])
+    #print "ratio capped"
+    #print ratio
+    if (context.beta[i][0] >0) & (context.beta[i][1] > 0):
+       # print "case1"
+        order_target_value(context.y[i], 1*ratio*context.portpos[i])
+        stock1T = context.beta[i][0]*data.current(context.x[i][0], 'price')
+        stock2T = context.beta[i][1]*data.current(context.x[i][1], 'price')
+        stock1percent = stock1T/(stock1T + stock2T + context.beta[i][2])
+        stock2percent = stock2T/(stock1T + stock2T + context.beta[i][2])
+        context.stoploss[i] = -0.05 * context.portpos[i]
+        order_target_value(context.x[i][0], -1*ratio*stock1percent*context.portpos[i])
+        order_target_value(context.x[i][1], -1*ratio*stock2percent*context.portpos[i])
+       
+    elif (context.beta[i][0] >0) & (context.beta[i][1] < 0):
+       # print "case2"
+        order_target_value(context.x[i][0], -1*ratio*context.portpos[i])
+        yT = data.current(context.y[i], 'price')
+        stock2T = context.beta[i][1]*data.current(context.x[i][1], 'price')
+        ypercent = yT/(yT - stock2T - context.beta[i][2])
+        stock2percent = -1 * stock2T/(yT - stock2T - context.beta[i][2])
+        context.stoploss[i] = -0.05 * context.portpos[i]
+        order_target_value(context.x[i][1], 1*ratio*stock2percent*context.portpos[i])
+        order_target_value(context.y[i], 1*ratio*ypercent*context.portpos[i])
+
+    elif (context.beta[i[0]] <0) & (context.beta[i[1]] > 0):
+        #print "case3"
+        order_target_value(context.x[i][1], -1*ratio*context.portpos[i])
+        yT = data.current(context.y[i], 'price')
+        stock1T = context.beta[i][0]*data.current(context.x[i][0], 'price')
+        ypercent = yT/(yT - stock1T - context.beta[i][2])
+        stock1percent = -1* stock1T/(yT - stock1T - context.beta[i][2])
+        context.stoploss[i] = -0.05 * context.portpos[i]
+        order_target_value(context.x[i][0], 1*ratio*stock1percent*context.portpos[i])
+        order_target_value(context.y[i], 1*ratio*ypercent*context.portpos[i])  
+        
+def my_short(context,data,i):    
+    print "shorting set {}".format(i+1)
+    context.open_finished[i] = 0
+    y = data.current(context.y[i], 'price')
+    x = [data.current(sec, 'price') for sec in context.x[i]]
+    spread = y - x[0] * context.beta[i][0] - x[1] * context.beta[i][1] - context.beta[i][2]
+    ratio = spread / context.sqrt_Q[i]
+    ratio = np.absolute(ratio)
+    #print "ratio1"
+    #print ratio
+    ratio = np.amin([0.5*ratio,0.5])
+    #print "ratio capped"
+    #print ratio
+    if (context.beta[i][0] >0) & (context.beta[i][1] > 0):
+       # print "case1"
+        order_target_value(context.y[i], -1*ratio*context.portpos[i])
+        stock1T = context.beta[i][0]*data.current(context.x[i][0], 'price')
+        stock2T = context.beta[i][1]*data.current(context.x[i][1], 'price')
+        stock1percent = stock1T/(stock1T + stock2T + context.beta[i][2])
+        stock2percent = stock2T/(stock1T + stock2T + context.beta[i][2])
+        context.stoploss[i] = -0.05 * context.portpos[i]
+        order_target_value(context.x[i][0], 1*ratio*stock1percent*context.portpos[i])
+        order_target_value(context.x[i][1], 1*ratio*stock2percent*context.portpos[i])
+       
+    elif (context.beta[i][0] >0) & (context.beta[i][1] < 0):
+       # print "case2"
+        order_target_value(context.x[i][0], 1*ratio*context.portpos[i])
+        yT = data.current(context.y[i], 'price')
+        stock2T = context.beta[i][1]*data.current(context.x[i][1], 'price')
+        ypercent = yT/(yT - stock2T - context.beta[i][2])
+        stock2percent = -1 * stock2T/(yT - stock2T - context.beta[i][2])
+        context.stoploss[i] = -0.05 * context.portpos[i]
+        order_target_value(context.x[i][1], -1*ratio*stock2percent*context.portpos[i])
+        order_target_value(context.y[i], -1*ratio*ypercent*context.portpos[i])
+
+    elif (context.beta[i[0]] <0) & (context.beta[i[1]] > 0):
+        #print "case3"
+        order_target_value(context.x[i][1], 1*ratio*context.portpos[i])
+        yT = data.current(context.y[i], 'price')
+        stock1T = context.beta[i][0]*data.current(context.x[i][0], 'price')
+        ypercent = yT/(yT - stock1T - context.beta[i][2])
+        stock1percent = -1* stock1T/(yT - stock1T - context.beta[i][2])
+        context.stoploss[i] = -0.05 * context.portpos[i]
+        order_target_value(context.x[i][0], -1*ratio*stock1percent*context.portpos[i])
+        order_target_value(context.y[i], -1*ratio*ypercent*context.portpos[i])  
+
+
+
+
