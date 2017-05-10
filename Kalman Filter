@@ -134,7 +134,7 @@ def kf(context,data,i):
     #print context.beta    
 
 def before_trading_start(context,data):
-    
+    print context.portfolio.cash
     context.activateDC = 1
     for i in range(0,context.setnumber):
         kf(context,data,i)
