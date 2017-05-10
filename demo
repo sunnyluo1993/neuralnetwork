@@ -1,0 +1,275 @@
+"""
+This is a template algorithm on Quantopian for you to adapt and fill in.
+"""
+from quantopian.algorithm import attach_pipeline, pipeline_output
+from quantopian.pipeline import Pipeline
+from quantopian.pipeline.data.builtin import USEquityPricing
+from quantopian.pipeline.factors import AverageDollarVolume
+from quantopian.pipeline.filters.morningstar import Q1500US
+import numpy as np
+import pytz
+from collections import defaultdict
+
+#how many strategy are included here
+strategynumber = 2 
+
+class dotDict:
+    #This class allows .notation for organizing data in context
+    def __init__(self):
+        pass
+    
+def initialize(context):
+    #orders ID stored for those that are still open
+    context.open_order = []
+    #how much of the is left for the order. 0 means it is finished 
+    context.order_update = []
+    #what stock is being ordered 
+    context.order_stock = []
+    #commission spent for a specific order 
+    context.track_commission = []
+    #open up a data base for each strategy for these 4 variables
+    for i in range(strategynumber):
+        context.open_order.append([])
+        context.order_update.append([])
+        context.order_stock.append([])
+        context.track_commission.append([])
+    context.context = {}
+    #open up a data base that will track each strategy as a portfolio just like context.portfolio
+    for i in range(strategynumber):
+        context.context[i] = dotDict()
+        strategy_init(context,i)
+    
+    #initialize each strategy in this main initialize
+    s0_initialize(context)
+    s1_initialize(context)
+
+def strategy_init(context, i):
+    context.context[i].portfolio = dotDict()
+    context.context[i].portfolio.starting_cash = context.portfolio.starting_cash / strategynumber 
+    context.context[i].portfolio.capital_used = 0
+    context.context[i].portfolio.cash = context.portfolio.starting_cash / strategynumber 
+    context.context[i].portfolio.portfolio_value = context.context[i].portfolio.cash
+    context.context[i].portfolio.pnl = 0
+    
+    #this position dictionary defaults each key with a 0 of amount and cost basis.  
+    context.context[i].portfolio.positions = {}
+    default = dotDict()
+    default.amount = 0 
+    default.cost_basis = 0
+    context.context[i].portfolio.positions = defaultdict(lambda: default, context.context[i].portfolio.positions)
+    
+    context.context[i].portfolio.positions_value = 0 
+    context.context[i].portfolio.returns = 0
+    
+    context.context[i].portfolio.start_date = context.portfolio.start_date
+        
+
+def before_trading_start(context,data):   
+    #each order will no longer be open after the end of a day. For safety, I set all the open order related variables to empty. 
+    context.open_order = []
+    context.order_update = []
+    context.order_stock = []
+    context.track_commission = []
+    for i in range(strategynumber):
+        context.open_order.append([])
+        context.order_update.append([])
+        context.order_stock.append([])
+        context.track_commission.append([])
+    
+    #I rerun the portfolio related variables everyday before market start based on the new stock price 
+        context.context[i].portfolio.positions_value = 0
+        stock_list = list(context.context[i].portfolio.positions.keys())
+        for j in range(len(stock_list)):
+            context.context[i].portfolio.positions[stock_list[j]].last_sale_price =  context.portfolio.positions[stock_list[j]].last_sale_price
+            context.context[i].portfolio.positions_value =  context.context[i].portfolio.positions_value + context.context[i].portfolio.positions[stock_list[j]].last_sale_price * context.context[i].portfolio.positions[stock_list[j]].amount   
+        context.context[i].portfolio.portfolio_value = context.context[i].portfolio.cash + context.context[i].portfolio.positions_value 
+        context.context[i].portfolio.pnl = context.context[i].portfolio.portfolio_value - context.context[i].portfolio.starting_cash
+        context.context[i].portfolio.returns = context.context[i].portfolio.pnl / context.context[i].portfolio.starting_cash   
+    
+    #this prints for demo purposes 
+    print context.portfolio.positions[sid(24)].amount
+    
+    #running all the strategies before_trading_start in this main one
+    s0_before_trading_start(context,data)
+    s1_before_trading_start(context,data)
+    
+def handle_data(context,data):
+    #Track order serves to updates each strategies' portfolio position based on new orders and updated stock price
+    for i in range(strategynumber):
+        track_order(context,data,i)
+    #calling all handle_data at this main one 
+    s1_handle_data(context,data)
+    
+    
+#this function serves to update portfolio information of each strategy. The i specifies which strategy this is. This runs at handle data which runs every minute
+def track_order(context, data, i):
+    #list all the stocks with a position 
+    
+    #check if we have any open orders for this portfolio
+    if (context.open_order[i] != []):
+        for j in range(0,len(context.open_order[i])):
+            #get the order information for each order
+            order = get_order(context.open_order[i][j])
+            
+            if (order is not None):
+                #make sure this order is not yet finished 
+                if (context.order_update[i][j] != 0):
+                    #order.amount gives us how much we want to order, and order_update gives us how much we needed to order in the LAST minute instance. Hence, last_filled is how much the order is filled last minute
+                    last_filled = order.amount - context.order_update[i][j]
+                    #order.filled gives how much is ordered minute, hence this difference is how much we have filled from this minute compare to the last minute
+                    shares_in = order.filled - last_filled
+                    #this is cost of this order for this specific minute based on how much is ordered and the current stock price 
+                    cost = shares_in * data.current(context.order_stock[i][j],'price')
+                    #we now update how much we still need to order for next minute to compare
+                    context.order_update[i][j] = order.amount - order.filled
+                    #we now calculate how much commission fee is generated for this minute. track commission starts with 0 at make_order
+                    new_commission = order.commission - context.track_commission[i][j]
+                    #we add the new_comission to the whole cost of this minute for this order
+                    cost = cost + new_commission
+                    #we update the new commission paid for this order 
+                    context.track_commission[i][j] = order.commission
+                    
+                    #we update the cash value of this portfolio based on how much stocks is purchased
+                    context.context[i].portfolio.cash = context.context[i].portfolio.cash - cost
+                    context.context[i].portfolio.capital_used = context.context[i].portfolio.capital_used - cost
+                
+                #we calculate the total cost of the stock at the last minute 
+                old_cost = context.context[i].portfolio.positions[context.order_stock[i][j]].amount * context.context[i].portfolio.positions[context.order_stock[i][j]].cost_basis
+                #we update how much of the stock we have in the strategy portfolio after this minute
+                context.context[i].portfolio.positions[context.order_stock[i][j]].amount = shares_in + context.context[i].portfolio.positions[context.order_stock[i][j]].amount
+                
+                #we update the cost_basis here 
+                if (context.context[i].portfolio.positions[context.order_stock[i][j]].amount != 0):
+                    context.context[i].portfolio.positions[context.order_stock[i][j]].cost_basis = (cost + old_cost)/ context.context[i].portfolio.positions[context.order_stock[i][j]].amount
+                else:
+                    context.context[i].portfolio.positions[context.order_stock[i][j]].cost_basis = 0   
+                    
+                    
+        #we data for orders that is already finished.             
+        remove = []
+        for j in range(0,len(context.open_order[i])):
+            
+            if (context.order_update[i][j] == 0):
+                remove.append(j)
+        pop = 0 
+        
+        for j in range(0,len(remove)):  
+            context.open_order[i].pop(remove[j]-pop)
+            context.order_update[i].pop(remove[j]-pop)
+            context.order_stock[i].pop(remove[j]-pop)
+            context.track_commission[i].pop(remove[j]-pop)
+            
+            pop = pop + 1 
+            
+    #listing stocks with a position 
+    stock_list = list(context.context[i].portfolio.positions.keys())
+    
+    #update portfolio position and other variables based on current stock price 
+    context.context[i].portfolio.positions_value  = 0 
+    for j in range(len(stock_list)):
+        context.context[i].portfolio.positions[stock_list[j]].last_sale_price =  context.portfolio.positions[stock_list[j]].last_sale_price
+        context.context[i].portfolio.positions_value =  context.context[i].portfolio.positions_value + data.current(stock_list[j],'price') * context.context[i].portfolio.positions[stock_list[j]].amount
+    
+    context.context[i].portfolio.portfolio_value = context.context[i].portfolio.cash + context.context[i].portfolio.positions_value 
+    context.context[i].portfolio.pnl = context.context[i].portfolio.portfolio_value - context.context[i].portfolio.starting_cash
+    context.context[i].portfolio.returns = context.context[i].portfolio.pnl / context.context[i].portfolio.starting_cash 
+    for j in range(len(stock_list)):
+        if (context.context[i].portfolio.positions[stock_list[j]].amount == 0):
+            context.context[i].portfolio.positions.pop(stock_list[j], None)         
+            
+#this is the function that all strategy will use to make any order
+#order method has to be one of the 6: order, order_value, order_target, order_percent, order_target_value, order_target_percent
+#sid is the stock
+#amount is the second field that users fill in for which ever order method that signifies the percentage or share number dependeing on the order method
+#OrderType allows the stoploss and limit feature. Please let out the "style =" part. Please input 0 if this is a market order (market order is the default order type in the normal order functions) 
+#i shows which strategy this is ordering for
+def make_order(context, data, order_method, sid, amount, OrderType, i):
+    stock_list = list(context.context[i].portfolio.positions.keys())
+    #create a key for stocks that is not in the postiion dictionary 
+    if (sid not in stock_list):
+        context.context[i].portfolio.positions[sid] = dotDict()
+        context.context[i].portfolio.positions[sid].amount = 0
+        context.context[i].portfolio.positions[sid].cost_basis = 0
+        context.context[i].portfolio.positions[sid].sid = context.portfolio.positions[sid].sid
+        context.context[i].portfolio.positions[sid].last_sale_price =  context.portfolio.positions[sid].last_sale_price
+    
+    if OrderType == 0:
+            OrderType = MarketOrder()
+    if (order_method is order):
+        my_order = order(sid, amount, style = OrderType)
+    elif (order_method is order_value):
+        my_order = order_value(sid, amount, style = OrderType)
+
+    elif (order_method is order_percent):
+        value = context.context[i].portfolio.portfolio_value * amount
+        my_order = order_value(sid, value, style = OrderType)
+    elif (order_method is order_target):   
+        target = amount - context.context[i].portfolio.positions[sid].amount
+        my_order = order(sid, target, style = OrderType)
+    elif (order_method is order_target_value):  
+        holding_value = data.current(sid,'price')*context.context[i].portfolio.positions[sid].amount
+        ordering_value = amount - holding_value
+        my_order = order_value(sid, ordering_value, style = OrderType)
+        
+    elif (order_method is order_target_percent):
+        holding_value = data.current(sid,'price')*context.context[i].portfolio.positions[sid].amount
+        ordering_value = amount*context.context[i].portfolio.portfolio_value - holding_value
+        my_order = order_value(sid, ordering_value, style = OrderType)
+    else:
+        my_order = 0
+        print "error in ordering"
+
+
+    if (get_order(my_order) is not None): 
+        context.open_order[i].append(my_order)
+        context.order_update[i].append(get_order(my_order).amount)
+        context.order_stock[i].append(sid)
+        context.track_commission[i].append(0)
+    #just like the normal order functions, this will return the order id 
+    return my_order  
+                       
+def s0_initialize(context):
+    schedule_function(
+        func=s0_buy,
+        date_rule=date_rules.every_day(),
+        time_rule=time_rules.market_open(minutes=1),
+        half_days=True
+    )
+    schedule_function(
+        func=s0_sell,
+        date_rule=date_rules.every_day(),
+        time_rule=time_rules.market_close(hours=1),
+        half_days=True
+    )
+
+def s1_initialize(context):
+    context.context[1].miniutecounter = 0 
+
+def s0_before_trading_start(context,data):
+    
+    print context.context[0].portfolio.positions[sid(24)].amount
+    
+def s0_buy(context,data):
+    #order(sid(24),100)
+    make_order(context,data,order,sid(24),100,LimitOrder(200),0)
+    
+def s0_sell(context,data):
+    apple = context.context[0].portfolio.positions[sid(24)].amount
+    #order(sid(24),-1*apple) 
+    #the 6th field is 0 because it the order is default marketorder
+    make_order(context,data,order,sid(24),-1*apple,0,0)
+    #order(sid(24),10) 
+    make_order(context,data,order,sid(24),10,0,0)
+
+def s1_before_trading_start(context,data):
+    
+    context.context[1].miniutecounter = 0 
+    print context.context[1].portfolio.positions[sid(24)].amount
+    
+def s1_handle_data(context,data):
+    context.context[1].miniutecounter = context.context[1].miniutecounter + 1
+    if (context.context[1].miniutecounter >60):
+        #order_target_percent(sid(24),0.5)
+        make_order(context,data,order_target_percent,sid(24),0.5,0,1)
+
+
