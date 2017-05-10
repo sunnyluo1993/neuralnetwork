@@ -86,6 +86,8 @@ def before_trading_start(context,data):
     record(s1_returns = context.context[1].portfolio.returns)
     #this prints for demo purposes 
     
+    print context.context[0].portfolio.cash
+    print context.context[1].portfolio.cash
     s0_before_trading_start(context,data)
     s1_before_trading_start(context,data)
     
